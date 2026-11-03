@@ -1,0 +1,6 @@
+aika-mvp/
+dist/
+artifacts/
+node_modules/
+dashboard.html
+*.tar

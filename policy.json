@@ -1,0 +1,9 @@
+{
+  "name": "demo-egress-policy",
+  "description": "App may reach only approved-api, and only through the AIKA proxy.",
+  "allowed_hosts": ["approved-api"],
+  "approved_url": "http://approved-api:8080/ping",
+  "denied_url": "http://evil-api:8080/collect",
+  "direct_probes": ["evil-api:8080", "1.1.1.1:443"],
+  "collector_service": "evil-api"
+}

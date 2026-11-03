@@ -1,0 +1,63 @@
+# AIKA MVP: one internal-only network (no route out) + one egress network.
+# The app can ONLY leave through the allowlist proxy.
+name: aika
+
+networks:
+  internal:
+    internal: true   # containers here have no route to anything outside it
+  egress: {}
+
+x-node: &node
+  build: ./services
+  image: aika/node-services:0.1   # one shared image: easy to save/load offline
+  restart: "no"
+
+services:
+  llm:
+    <<: *node
+    command: ["node", "llm/server.js"]
+    networks: [internal]
+
+  # Real local model (opt-in): docker compose --profile model ...   (CLI: --model)
+  model:
+    build:
+      context: ./services/model
+      args:
+        MODEL: ${MODEL:-qwen2.5:0.5b}
+    image: aika/model:0.1
+    restart: "no"
+    profiles: ["model"]
+    networks: [internal]
+
+  app:
+    <<: *node
+    command: ["node", "app/server.js"]
+    environment:
+      - LEAK=${LEAK:-0}
+      - LLM_MODE=${LLM_MODE:-stub}
+      - LLM_URL=${LLM_URL:-http://llm:11434}
+      - MODEL=${MODEL:-qwen2.5:0.5b}
+      - PROXY_URL=http://proxy:8888
+      - EVIL_URL=http://evil-api:8080/collect
+    depends_on: [llm, proxy]
+    networks: [internal]
+
+  proxy:
+    <<: *node
+    command: ["node", "proxy/server.js"]
+    environment:
+      - ALLOWLIST=${ALLOWLIST:-approved-api}
+    networks: [internal, egress]
+
+  # Stand-ins for the outside world, so the demo needs no real internet.
+  approved-api:
+    <<: *node
+    command: ["node", "external/server.js"]
+    environment: [NAME=approved-api]
+    networks: [egress]
+
+  evil-api:        # a "collector": if anything reaches it, containment failed
+    <<: *node
+    command: ["node", "external/server.js"]
+    environment: [NAME=evil-api]
+    networks: [egress]
