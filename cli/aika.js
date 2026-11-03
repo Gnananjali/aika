@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // AIKA MVP CLI
-//   node cli/aika.js verify [--leak] [--keep] [--offline] [--model]
+//   node cli/aika.js verify [--leak] [--keep] [--offline] [--model] [--extended]
 //   node cli/aika.js bundle [--model] [--skip-build]   (connected build machine)
 //   node cli/aika.js verify-bundle [dir]    (isolated machine: integrity check only)
 //   node cli/aika.js install [dir]          (isolated machine: check + load images)
 //   node cli/aika.js dashboard [--open]     (read-only HTML overview of reports and bundle)
+//   node cli/aika.js keygen [dir]           (create a signing key pair; keep the private key secret)
+//   bundle --sign <private.pem>             (sign the manifest)    verify-bundle|install --pubkey <public.pem>
 // --model : use a REAL local model (Ollama, baked into the bundle) instead of the stub.
 const { execFileSync } = require('child_process');
 const fs = require('fs');
@@ -13,6 +15,7 @@ const crypto = require('crypto');
 const { renderHtml } = require('./report');
 const { buildManifest, verifyManifest, hostProbe } = require('./bundle');
 const { buildDashboard } = require('./dashboard');
+const { generateKeys, signFile, verifyFile, fingerprintOfPrivateKeyFile } = require('./signing');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMPOSE = path.join(ROOT, 'docker-compose.yml');
@@ -28,6 +31,11 @@ const LEAK = args.includes('--leak');
 const KEEP = args.includes('--keep');
 const OFFLINE = args.includes('--offline');
 const MODEL = args.includes('--model');
+// Flags that take a value, and a way to read them. positional() returns arguments that are not flags or flag values.
+const VALUE_FLAGS = ['--sign', '--pubkey'];
+const argVal = flag => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
+const positional = () => args.slice(1).filter((a, i, arr) => !a.startsWith('--') && !VALUE_FLAGS.includes(arr[i - 1]));
+const EXTENDED = args.includes('--extended');
 
 const profileArgs = MODEL ? ['--profile', 'model'] : [];
 const composeEnv = () => ({
@@ -104,7 +112,9 @@ async function verify() {
   add('allowed-works', 'Approved destination is reachable through the proxy', ok.status === 200, `status ${ok.status}`);
 
   // 4. Denied destination refused by proxy
+  const probeStart = Date.now();
   const bad = probe('proxied', policy.denied_url);
+  const probeEnd = Date.now();
   add('denied-blocked', 'Non-approved destination is refused by the proxy', bad.status === 403, `status ${bad.status}`);
 
   // 5. Independent evidence: the outside collector never heard from the app
@@ -112,16 +122,35 @@ async function verify() {
   const hits = JSON.parse(hitsRaw);
   add('collector-silent', 'Outside collector received zero requests', hits.count === 0, `collector saw ${hits.count} request(s)`);
 
+  // 6. Extended checks (opt-in): DNS and model-container isolation
+  if (EXTENDED) {
+    const d = probe('dns', policy.dns_probe || 'example.com');
+    add('dns-blocked', 'External DNS names cannot be resolved from the app', !d.resolved,
+      d.resolved ? `RESOLVED ${d.name} to ${d.address}` : `lookup of ${d.name} failed (${d.error})`);
+    if (MODEL) {
+      let r;
+      try {
+        if (dc(['exec', '-T', 'model', 'bash', '-c', 'echo ok']).trim() !== 'ok') throw new Error('shell test failed');
+        try {
+          dc(['exec', '-T', 'model', 'bash', '-c', 'timeout 3 bash -c "echo > /dev/tcp/1.1.1.1/443"']);
+          r = { pass: false, detail: 'the model container REACHED 1.1.1.1:443' };
+        } catch { r = { pass: true, detail: 'the model container could not connect to 1.1.1.1:443' }; }
+      } catch { r = { pass: false, detail: 'could not run the test inside the model container' }; }
+      add('model-isolated', 'The model container has no route to the public internet', r.pass, r.detail);
+    }
+  }
+
   // Evidence logs
   const proxyLog = dc(['logs', '--no-color', '--no-log-prefix', 'proxy']);
   const appLog = dc(['logs', '--no-color', '--no-log-prefix', 'app']);
-  const blockedEvents = jsonLines(proxyLog).filter(e => e.event === 'blocked');
+  // Ignore the proxy refusal caused by the verifier's own denied-destination probe (matched by time window).
+  const ownProbe = e => { const t = Date.parse(e.ts); return t >= probeStart - 3000 && t <= probeEnd + 3000; };
+  const blockedEvents = jsonLines(proxyLog).filter(e => e.event === 'blocked' && !ownProbe(e));
   const appAttempts = jsonLines(appLog).filter(e => e.event === 'outbound_attempt');
   const attempts = [
     ...appAttempts.map(a => `app → ${a.dest} via ${a.route}: ${a.outcome}${a.error ? ' (' + a.error + ')' : ''}`),
     ...blockedEvents.map(b => `proxy refused ${b.method} to ${b.host}:${b.port}`)
   ];
-  // The verifier's own denied probe shows up as one proxy refusal; do not count it as app behaviour.
   const appBlockedCount = appAttempts.length;
 
   const failed = checks.filter(c => !c.pass);
@@ -143,12 +172,12 @@ async function verify() {
   const limitations = [
     'The "outside world" in this run is simulated by services on a local Docker network, not the real internet.',
     'Only the paths listed in the checks were tested. A clean result does not prove that no other path exists.',
-    'DNS-based leakage, covert channels, and host-level firewall behaviour were not tested.',
+    EXTENDED ? 'DNS was tested with one external name lookup only. Covert channels and host-level firewall behaviour were not tested.' : 'DNS-based leakage, covert channels, and host-level firewall behaviour were not tested.',
     'Isolation is container-level (Docker internal network); the host and Docker daemon are assumed trusted.',
     'This report is evidence for review, not a security certification or compliance statement.'
   ];
   limitations.push(MODEL
-    ? `The model (${MODEL_NAME}) is a very small open-weight model, so answers are low quality. Its license must be checked before commercial use. The model container's own network behaviour is blocked by the internal network but not separately tested.`
+    ? `The model (${MODEL_NAME}) is a very small open-weight model, so answers are low quality. Its license must be checked before commercial use. ${EXTENDED ? "The model container's isolation was tested with a single TCP connection attempt." : "The model container's own network behaviour is blocked by the internal network but not separately tested."}`
     : 'The model in this run is a stub that returns canned answers. It is not a real AI model.');
   if (OFFLINE) limitations.push('The offline-proof check tests routes to two public addresses only. It does not prove the machine is physically disconnected.');
   const report = {
@@ -203,6 +232,7 @@ Prerequisites on the isolated machine (install them separately from approved med
    Leaky demo:                             node cli/aika.js verify --offline --leak${flag}
 4. Read the results:                       node cli/aika.js dashboard --open
 
+If the bundle is signed, also check who made it:  node cli/aika.js verify-bundle --pubkey <their-public-key.pem>
 Compare the manifest fingerprint printed by step 1 with the one given to you on a separate channel.
 Checksums catch corruption and accidental changes. They do NOT prove who made the bundle; signing is a later step.
 ${MODEL ? `The model (${MODEL_NAME}) is very small, so answers are low quality. Check its license before commercial use.\n` : ''}`);
@@ -213,9 +243,15 @@ ${MODEL ? `The model (${MODEL_NAME}) is very small, so answers are low quality. 
     model: MODEL ? { name: MODEL_NAME, runtime: 'ollama', image: MODEL_IMAGE } : null,
     built_with: { docker: docker(['--version']).trim(), node: process.version, platform: `${process.platform}/${process.arch}` }
   });
+  const signKey = argVal('--sign');
+  let signerFp = null;
+  if (signKey) {
+    signerFp = signFile(path.join(out, 'manifest.json'), signKey, path.join(out, 'manifest.sig'));
+  }
   console.log(`\nBundle ready: ${out}`);
   console.log(`Files: ${manifest.files.length}`);
   console.log(`Manifest fingerprint (sha256): ${fingerprint}`);
+  console.log(signerFp ? `Signed. Signer public-key fingerprint (sha256): ${signerFp}\nShare the PUBLIC key file with the other side on a separate channel.` : 'Not signed (add --sign <private-key.pem> to sign).');
   console.log('Copy the whole folder to approved media, and share the fingerprint on a separate channel.');
 }
 
@@ -230,6 +266,17 @@ async function checkBundle(dirArg) {
   if (r.mismatched.length) console.log(`CHANGED:    ${r.mismatched.join(', ')}`);
   if (r.extra.length) console.log(`UNLISTED:   ${r.extra.join(', ')}`);
   console.log(r.ok ? 'PASS  every file matches the manifest' : 'FAIL  bundle does not match its manifest — do not install');
+  const pubkey = argVal('--pubkey');
+  if (pubkey) {
+    const sig = verifyFile(path.join(dir, 'manifest.json'), path.join(dir, 'manifest.sig'), pubkey);
+    console.log(`${sig.ok ? 'PASS' : 'FAIL'}  signature: ${sig.reason}${sig.fingerprint ? ' (key fingerprint ' + sig.fingerprint + ')' : ''}`);
+    r.signature = sig;
+    if (!sig.ok) r.ok = false;
+  } else if (fs.existsSync(path.join(dir, 'manifest.sig'))) {
+    console.log('NOTE  this bundle is signed, but no --pubkey was given, so WHO made it was not checked.');
+  } else {
+    console.log('NOTE  this bundle is not signed, so WHO made it cannot be checked.');
+  }
   return r;
 }
 
@@ -249,6 +296,14 @@ async function install(dirArg) {
   console.log(`Next: node cli/aika.js verify --offline${flag}`);
 }
 
+function keygen() {
+  const dir = path.resolve(positional()[0] || path.join(ROOT, 'keys'));
+  const k = generateKeys(dir);
+  console.log(`Private key (KEEP SECRET, never commit or share): ${k.priv}`);
+  console.log(`Public key  (share on a separate channel):       ${k.pub}`);
+  console.log(`Public-key fingerprint (sha256): ${k.fingerprint}`);
+}
+
 async function dashboard() {
   const out = path.join(ROOT, 'dashboard.html');
   fs.writeFileSync(out, await buildDashboard(ROOT));
@@ -263,10 +318,11 @@ async function dashboard() {
   try {
     if (cmd === 'verify') await verify();
     else if (cmd === 'bundle') await bundle();
-    else if (cmd === 'verify-bundle') process.exit((await checkBundle(args[1])).ok ? 0 : 1);
-    else if (cmd === 'install') await install(args[1]);
+    else if (cmd === 'verify-bundle') process.exit((await checkBundle(positional()[0])).ok ? 0 : 1);
+    else if (cmd === 'install') await install(positional()[0]);
     else if (cmd === 'dashboard') await dashboard();
-    else console.log('Usage:\n  node cli/aika.js verify [--leak] [--keep] [--offline] [--model]\n  node cli/aika.js bundle [--model] [--skip-build]\n  node cli/aika.js verify-bundle [dir]\n  node cli/aika.js install [dir]\n  node cli/aika.js dashboard [--open]');
+    else if (cmd === 'keygen') keygen();
+    else console.log('Usage:\n  node cli/aika.js verify [--leak] [--keep] [--offline] [--model] [--extended]\n  node cli/aika.js bundle [--model] [--skip-build]\n  node cli/aika.js verify-bundle [dir]\n  node cli/aika.js install [dir]\n  node cli/aika.js dashboard [--open]\n  node cli/aika.js keygen [dir]\n  (bundle --sign <private.pem>; verify-bundle / install --pubkey <public.pem>)');
   } catch (e) {
     console.error(e.stderr || e.message);
     if (cmd === 'verify' && !KEEP) { try { dc(['down', '-v']); } catch {} }

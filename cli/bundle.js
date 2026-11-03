@@ -4,7 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const net = require('net');
 
-const SKIP_IN_MANIFEST = new Set(['manifest.json', 'SHA256SUMS']);
+const SKIP_IN_MANIFEST = new Set(['manifest.json', 'SHA256SUMS', 'manifest.sig']);
 
 function sha256File(file) {
   return new Promise((resolve, reject) => {

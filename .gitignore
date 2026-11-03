@@ -4,3 +4,4 @@ artifacts/
 node_modules/
 dashboard.html
 *.tar
+keys/
