@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // AIKA MVP CLI
-//   node cli/aika.js verify [--leak] [--keep] [--offline] [--model] [--extended]
+//   node cli/aika.js verify [--leak] [--keep] [--offline] [--model] [--capture] [--extended]
 //   node cli/aika.js bundle [--model] [--skip-build]   (connected build machine)
 //   node cli/aika.js verify-bundle [dir]    (isolated machine: integrity check only)
 //   node cli/aika.js install [dir]          (isolated machine: check + load images)
@@ -10,12 +10,14 @@
 // --model : use a REAL local model (Ollama, baked into the bundle) instead of the stub.
 const { execFileSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { renderHtml } = require('./report');
 const { buildManifest, verifyManifest, hostProbe } = require('./bundle');
 const { buildDashboard } = require('./dashboard');
 const { generateKeys, signFile, verifyFile, fingerprintOfPrivateKeyFile } = require('./signing');
+const { summarize } = require('./pcap');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMPOSE = path.join(ROOT, 'docker-compose.yml');
@@ -31,13 +33,14 @@ const LEAK = args.includes('--leak');
 const KEEP = args.includes('--keep');
 const OFFLINE = args.includes('--offline');
 const MODEL = args.includes('--model');
+const CAPTURE = args.includes('--capture');   // record packets inside the app's network namespace
 // Flags that take a value, and a way to read them. positional() returns arguments that are not flags or flag values.
 const VALUE_FLAGS = ['--sign', '--pubkey'];
 const argVal = flag => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
 const positional = () => args.slice(1).filter((a, i, arr) => !a.startsWith('--') && !VALUE_FLAGS.includes(arr[i - 1]));
 const EXTENDED = args.includes('--extended');
 
-const profileArgs = MODEL ? ['--profile', 'model'] : [];
+const profileArgs = [...(MODEL ? ['--profile', 'model'] : []), ...(CAPTURE ? ['--profile', 'capture'] : [])];
 const composeEnv = () => ({
   LEAK: LEAK ? '1' : '0', ALLOWLIST: policy.allowed_hosts.join(','),
   ...(MODEL ? { LLM_MODE: 'ollama', LLM_URL: 'http://model:11434', MODEL: MODEL_NAME } : {})
@@ -77,6 +80,14 @@ async function verify() {
   let healthy = false;
   for (let i = 0; i < 30 && !healthy; i++) { try { healthy = probe('health').ok; } catch {} if (!healthy) await sleep(1000); }
   if (!healthy) { console.error('App did not become healthy.'); dc(['down', '-v']); process.exit(2); }
+
+  if (CAPTURE) {
+    let recording = false;
+    for (let i = 0; i < 20 && !recording; i++) {
+      try { dc(['exec', '-T', 'capture', 'test', '-f', '/capture/aika.pcap']); recording = true; } catch { await sleep(1000); }
+    }
+    if (!recording) console.log('WARNING: packet capture did not start; the capture checks will fail.');
+  }
 
   if (OFFLINE) {
     add('offline-proof', 'This machine has no route to the public internet during the run', !hp.reachable,
@@ -140,6 +151,25 @@ async function verify() {
     }
   }
 
+  // 6. Packet capture (only with --capture): what actually crossed the app's network connection
+  let captureSummary = null, tmpPcap = null;
+  if (CAPTURE) {
+    await sleep(1500); // let tcpdump flush the last packets
+    tmpPcap = path.join(os.tmpdir(), `aika-capture-${Date.now()}.pcap`);
+    try {
+      dc(['cp', 'capture:/capture/aika.pcap', tmpPcap]);
+      const ownIps = policy.direct_probes.map(t => t.split(':')[0]).filter(h => /^\d+\.\d+\.\d+\.\d+$/.test(h));
+      captureSummary = summarize(fs.readFileSync(tmpPcap), { ownProbeIps: ownIps });
+    } catch (e) { captureSummary = null; }
+    if (!captureSummary || captureSummary.packets === 0) {
+      add('capture-ran', 'Packet capture recorded traffic', false, 'no packets were captured');
+    } else {
+      add('capture-ran', 'Packet capture recorded traffic', true, `${captureSummary.packets} packets captured inside the app's network namespace`);
+      add('capture-no-public', 'No packet to or from a public IP address was captured', captureSummary.publicAddresses.length === 0,
+        captureSummary.publicAddresses.length ? `public addresses seen: ${captureSummary.publicAddresses.join(', ')}` : 'every captured packet stayed on private or local addresses');
+    }
+  }
+
   // Evidence logs
   const proxyLog = dc(['logs', '--no-color', '--no-log-prefix', 'proxy']);
   const appLog = dc(['logs', '--no-color', '--no-log-prefix', 'app']);
@@ -166,6 +196,7 @@ async function verify() {
   fs.writeFileSync(path.join(dir, 'app.log'), appLog);
   fs.writeFileSync(path.join(dir, 'collector_hits.json'), JSON.stringify(hits, null, 2));
   fs.writeFileSync(path.join(dir, 'policy.json'), JSON.stringify(policy, null, 2));
+  if (captureSummary) fs.copyFileSync(tmpPcap, path.join(dir, 'capture.pcap'));
 
   const sha = f => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex').slice(0, 16);
   const sh = (c, a) => { try { return execFileSync(c, a, { encoding: 'utf8' }).trim().split('\n')[0]; } catch { return 'unknown'; } };
@@ -179,16 +210,19 @@ async function verify() {
   limitations.push(MODEL
     ? `The model (${MODEL_NAME}) is a very small open-weight model, so answers are low quality. Its license must be checked before commercial use. ${EXTENDED ? "The model container's isolation was tested with a single TCP connection attempt." : "The model container's own network behaviour is blocked by the internal network but not separately tested."}`
     : 'The model in this run is a stub that returns canned answers. It is not a real AI model.');
+  if (CAPTURE) limitations.push("The packet capture covers traffic seen inside the app container's network namespace only. It includes the verifier's own test traffic (it deliberately looks up evil-api and probes 1.1.1.1), and it does not inspect encrypted contents.");
   if (OFFLINE) limitations.push('The offline-proof check tests routes to two public addresses only. It does not prove the machine is physically disconnected.');
   const report = {
     timestamp: ts, mode: OFFLINE ? 'offline' : 'standard', leakVariant: LEAK, policy, verdict, checks, attempts,
-    evidence: ['proxy.log', 'app.log', 'collector_hits.json', 'policy.json'],
+    evidence: ['proxy.log', 'app.log', 'collector_hits.json', 'policy.json', ...(captureSummary ? ['capture.pcap'] : [])],
+    capture: captureSummary || undefined,
     limitations,
     environment: {
       docker: sh('docker', ['--version']), node: process.version, platform: `${process.platform}/${process.arch}`,
       compose_sha256_prefix: sha(COMPOSE), policy_sha256_prefix: sha(path.join(ROOT, 'policy.json')),
       images: neededImages().join(', '), host_internet_probe: hp ? (hp.reachable ? 'reachable' : 'unreachable') : 'not run',
-      model: MODEL ? `${MODEL_NAME} (real, via Ollama)` : 'stub (canned answers)'
+      model: MODEL ? `${MODEL_NAME} (real, via Ollama)` : 'stub (canned answers)',
+      capture: CAPTURE ? 'tcpdump inside the app network namespace' : 'not run'
     }
   };
   fs.writeFileSync(path.join(dir, 'report.json'), JSON.stringify(report, null, 2));

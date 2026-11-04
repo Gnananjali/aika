@@ -6,6 +6,12 @@ function renderHtml(r) {
   const attempts = r.attempts.length
     ? r.attempts.map(a => `<li>${esc(a)}</li>`).join('')
     : '<li>None observed</li>';
+  const c = r.capture;
+  const capRows = (items, cols) => items.length ? items.map(i => `<tr>${cols.map(k => `<td>${esc(i[k])}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${cols.length}" class="muted">none</td></tr>`;
+  const cap = c ? `<h2>Packet capture (inside the app's network namespace)</h2>
+<p>${esc(c.packets)} packets captured. ${c.publicAddresses.length ? '<b>Public addresses seen: ' + esc(c.publicAddresses.join(', ')) + '</b>' : 'No packet involved a public IP address.'}${c.ownProbeAddresses.length ? ' The verifier itself probed ' + esc(c.ownProbeAddresses.join(', ')) + '.' : ''}</p>
+<table><tr><th>DNS name looked up</th><th>Type</th><th>Count</th></tr>${capRows(c.dnsQueries, ['name', 'type', 'count'])}</table>
+<table><tr><th>TCP connection attempts to</th><th>Count</th></tr>${capRows(c.tcpConnections, ['to', 'count'])}</table>` : '';
   const lims = r.limitations.map(l => `<li>${esc(l)}</li>`).join('');
   const env = Object.entries(r.environment).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -22,7 +28,7 @@ th{background:#f6f8fa}.muted{color:#57606a;font-size:13px}
 <h2>Checks</h2><table><tr><th></th><th>Check</th><th>Result</th></tr>${rows}</table>
 <h2>Unapproved connection attempts observed</h2><ul>${attempts}</ul>
 <h2>Evidence files</h2><ul>${r.evidence.map(e => `<li>${esc(e)}</li>`).join('')}</ul>
-<h2>Limitations (what this report does NOT show)</h2><ul>${lims}</ul>
+${cap}<h2>Limitations (what this report does NOT show)</h2><ul>${lims}</ul>
 <h2>Environment</h2><table>${env}</table>
 </body></html>`;
 }

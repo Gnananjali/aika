@@ -4,12 +4,12 @@ name: aika
 
 networks:
   internal:
-    internal: true   # containers here have no route to anything outside it
+    internal: true # containers here have no route to anything outside it
   egress: {}
 
 x-node: &node
   build: ./services
-  image: aika/node-services:0.1   # one shared image: easy to save/load offline
+  image: aika/node-services:0.1 # one shared image: easy to save/load offline
   restart: "no"
 
 services:
@@ -56,8 +56,28 @@ services:
     environment: [NAME=approved-api]
     networks: [egress]
 
-  evil-api:        # a "collector": if anything reaches it, containment failed
+  evil-api: # a "collector": if anything reaches it, containment failed
     <<: *node
     command: ["node", "external/server.js"]
     environment: [NAME=evil-api]
     networks: [egress]
+
+  # Packet capture (opt-in: docker compose --profile capture ...   CLI: --capture)
+  # Shares the APP container's network namespace, so it sees exactly the packets the app sees.
+  capture:
+    <<: *node
+    command:
+      [
+        "tcpdump",
+        "-i",
+        "any",
+        "-nn",
+        "-U",
+        "-Z",
+        "root",
+        "-w",
+        "/capture/aika.pcap",
+      ]
+    network_mode: "service:app"
+    cap_add: [NET_RAW, NET_ADMIN]
+    profiles: ["capture"]
